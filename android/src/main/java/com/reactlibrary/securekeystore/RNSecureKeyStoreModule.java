@@ -8,7 +8,15 @@ package com.reactlibrary.securekeystore;
 
 import android.content.Context;
 import android.os.Build;
-import android.security.KeyPairGeneratorSpec;
+
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.security.keystore.KeyPermanentlyInvalidatedException;
+
+// todo: when api level 28 is more widespread use BiometricPrompt instead
+import moe.feng.support.biometricprompt.BiometricPromptCompat;
+import moe.feng.support.biometricprompt.BiometricPromptCompat.IAuthenticationCallback
+
 import android.util.Log;
 
 import com.facebook.react.bridge.Promise;
@@ -38,13 +46,45 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
 import javax.security.auth.x500.X500Principal;
 
-public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
+public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule, IAuthenticationCallback {
 
   private final ReactApplicationContext reactContext;
+
+  private CancellationSignal bioCancel;
+  private Promise bioPm;
+  private byte[] bioCipherBytes;
+  private BiometricPromptCompat bioPrompt;
 
   public RNSecureKeyStoreModule(ReactApplicationContext reactContext) {
     super(reactContext);
     this.reactContext = reactContext;
+  }
+
+  @Override
+  public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+    Cipher cipher = result.getCryptoObject().getCipher()
+    byte[] decrypted = decryptCipherText(cipher, bioCipherTextBytes);
+    String base64 = Base64.encodeToString(decrypted, Base64.DEFAULT);
+    bioPromise.resolve(base64);
+  }
+
+  @Override
+  public void onAuthenticationHelp(int helpCode, CharSequence helpString) {
+      // existing display behavior is fine
+  }
+
+  @Override
+  public void onAuthenticationError(int errorCode, CharSequence errString) {
+    this.bioCipherBytes = null;
+    this.bioCancel.cancel()
+    bioPromise.reject(errString);
+  }
+
+  @Override
+  public void onAuthenticationFailed() {
+    this.bioCipherBytes = null;
+    this.bioCancel.cancel()
+    bioPromise.reject("Authentication failed");
   }
 
   @Override
@@ -55,7 +95,7 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
   @ReactMethod
   public void set(String alias, String input, @Nullable ReadableMap options, Promise promise) {
     try {
-      setCipherText(alias, input);
+      setCipherText(alias, input, options);
       promise.resolve("stored ciphertext in app storage");
     } catch (Exception e) {
       e.printStackTrace();
@@ -64,32 +104,67 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
     }
   }
 
-  private PublicKey getOrCreatePublicKey(String alias) throws GeneralSecurityException, IOException {
+  @ReactMethod
+  public void decrypt(String alias, String b64input, @Nullable ReadableMap options, Promise promise) {
+    try {
+      byte[] data = Base64.decode(b64input, Base64.DEFAULT);
+
+      // todo: decide if needs fingerprint first, then call this function
+      decryptRsaToPromise(alias, data, promise);
+
+      //byte[] decrypted = decryptRsaCipherText(getPrivateKey(alias), data);
+      //String base64 = Base64.encodeToString(decrypted, Base64.DEFAULT);
+      //promise.resolve(base64);
+    } catch (Exception e) {
+      e.printStackTrace();
+      Log.e(Constants.TAG, "Exception: " + e.getMessage());
+      promise.reject("{\"code\":9,\"api-level\":" + Build.VERSION.SDK_INT + ",\"message\":" + e.getMessage() + "}");
+    }
+  }
+
+  @ReactMethod
+  public void getPublicKey(String alias, String b64input, @Nullable ReadableMap options, Promise promise) {
+    try {
+      PublicKey publicKey = getOrCreatePublicKey(alias, options);
+      byte[] pubk = publicKey.getEncoded();
+      String base64 = Base64.encodeToString(pubk, Base64.DEFAULT);
+      promise.resolve(base64);
+    } catch (Exception e) {
+      e.printStackTrace();
+      Log.e(Constants.TAG, "Exception: " + e.getMessage());
+      promise.reject("{\"code\":9,\"api-level\":" + Build.VERSION.SDK_INT + ",\"message\":" + e.getMessage() + "}");
+    }
+  }
+
+  private PublicKey getOrCreatePublicKey(String alias, @Nullable ReadableMap options) throws GeneralSecurityException, IOException {
     KeyStore keyStore = KeyStore.getInstance(getKeyStore());
     keyStore.load(null);
 
     if (!keyStore.containsAlias(alias) || keyStore.getCertificate(alias) == null) {
       Log.i(Constants.TAG, "no existing asymmetric keys for alias");
 
-      Calendar start = Calendar.getInstance();
-      Calendar end = Calendar.getInstance();
-      end.add(Calendar.YEAR, 50);
-      KeyPairGeneratorSpec spec = new KeyPairGeneratorSpec.Builder(getContext())
-          .setAlias(alias)
-          .setSubject(new X500Principal("CN=" + alias))
-          .setSerialNumber(BigInteger.ONE)
-          .setStartDate(start.getTime())
-          .setEndDate(end.getTime())
+      // todo: support ECIES whenever android gets around tuit
+      // todo: make options affect how the key is created
+      KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+          .setIsStrongBoxBacked(true)
+          .setUserConfirmationRequired(true)
+          .setUserAuthenticationRequired(true)
+          // todo: detect max available in the hardware security module
+          .setKeySize(2048)
+          .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
+          // todo: should be an option, not hardcoded
+          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
           .build();
-
-      KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", getKeyStore());
+      
+      KeyPairGenerator generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, getKeyStore());
       generator.initialize(spec);
       generator.generateKeyPair();
 
       Log.i(Constants.TAG, "created new asymmetric keys for alias");
+      keyStore.load(null);
     }
 
-    return keyStore.getCertificate(alias).getPublicKey();
+    return keyStore.getKey(alias, null).getPublicKey();
   }
 
   private byte[] encryptRsaPlainText(PublicKey publicKey, byte[] plainTextBytes) throws GeneralSecurityException, IOException {
@@ -116,7 +191,7 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
     return outputStream.toByteArray();
   }
 
-  private SecretKey getOrCreateSecretKey(String alias) throws GeneralSecurityException, IOException {
+  private SecretKey getOrCreateSecretKey(String alias, @Nullable ReadableMap options) throws GeneralSecurityException, IOException {
     try {
       return getSymmetricKey(alias);
     } catch (FileNotFoundException fnfe) {
@@ -126,7 +201,7 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
       //32bytes / 256bits AES key
       keyGenerator.init(256);
       SecretKey secretKey = keyGenerator.generateKey();
-      PublicKey publicKey = getOrCreatePublicKey(alias);
+      PublicKey publicKey = getOrCreatePublicKey(alias, options);
       Storage.writeValues(getContext(), Constants.SKS_KEY_FILENAME + alias,
           encryptRsaPlainText(publicKey, secretKey.getEncoded()));
 
@@ -135,9 +210,9 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
     }
   }
 
-  private void setCipherText(String alias, String input) throws GeneralSecurityException, IOException {
+  private void setCipherText(String alias, String input, @Nullable ReadableMap options) throws GeneralSecurityException, IOException {
     Storage.writeValues(getContext(), Constants.SKS_DATA_FILENAME + alias,
-        encryptAesPlainText(getOrCreateSecretKey(alias), input));
+        encryptAesPlainText(getOrCreateSecretKey(alias, options), input));
   }
 
   @ReactMethod
@@ -158,6 +233,19 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
     KeyStore keyStore = KeyStore.getInstance(getKeyStore());
     keyStore.load(null);
     return (PrivateKey) keyStore.getKey(alias, null);
+  }
+
+  void decryptRsaToPromise(PrivateKey privateKey, byte[] cipherTextBytes, Promise pm) throws GeneralSecurityException, IOException {
+      if (bioCancel != null) {
+          bioCancel.cancel();
+      }
+      bioCancel = new CancellationSignal()
+      bioPrompt = new BiometricPromptCompat.Builder(bioContext)
+                        .setTitle("Authentication required")
+                        .setSubtitle("Please use fingerprint reader to unlock")
+                        .build();
+      bioPm = pm;
+      bioPrompt.authenticate(bioCancel, this);
   }
 
   private byte[] decryptRsaCipherText(PrivateKey privateKey, byte[] cipherTextBytes) throws GeneralSecurityException, IOException {
